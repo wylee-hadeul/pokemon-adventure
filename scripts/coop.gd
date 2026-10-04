@@ -25,6 +25,7 @@ var p_step := 0
 var send_t := 0.0
 var last_pos := ""
 var pending_req := ""        # 내가 보낸 신청 (답을 기다리는 중)
+var req_t := 0.0
 # 교환
 var my_offer := -1
 var their_offer = null
@@ -94,6 +95,12 @@ func _on_left(from: String) -> void:
 
 
 func _process(delta: float) -> void:
+	if pending_req != "":
+		req_t -= delta
+		if req_t <= 0.0 or not connected():
+			pending_req = ""
+			main.field.lock = false
+			main.show_toast("친구가 대답하지 않아요")
 	if not connected():
 		return
 	p_draw = p_draw.move_toward(Vector2(p_pos), delta / 0.15)
@@ -125,7 +132,12 @@ func request(kind: String) -> void:
 	if not connected():
 		main.show_toast("친구와 연결되어 있지 않아요")
 		return
+	if pending_req != "":
+		return
 	pending_req = kind
+	req_t = 15.0
+	if main.state == main.State.FIELD or main.state == main.State.FRIEND:
+		main.field.lock = true  # 답을 기다리는 동안 멈춤
 	send({"t": "req", "k": kind, "party": party_dicts(main.party)})
 	main.show_toast("친구에게 %s을 신청했어요... 기다리는 중" % ("대전" if kind == "battle" else "교환"))
 
@@ -137,6 +149,10 @@ func answer(kind: String, ok: bool) -> void:
 
 
 func _begin(kind: String) -> void:
+	var free: bool = main.state in [main.State.TOWN, main.State.FIELD, main.State.FRIEND, main.State.MENU, main.State.LOBBY, main.State.STAGES] and not main.dlg_busy() and main.trans_t <= 0.0
+	if not free:
+		send({"t": "forfeit"} if kind == "battle" else {"t": "trade_cancel"})
+		return
 	if kind == "battle":
 		main.start_pvp(p_party)
 	else:
@@ -214,6 +230,7 @@ func _on_msg(_from: String, d: Dictionary) -> void:
 		"ans":
 			p_party = d.get("party", p_party)
 			pending_req = ""
+			main.field.lock = false
 			if d.ok:
 				_begin(d.k)
 			else:

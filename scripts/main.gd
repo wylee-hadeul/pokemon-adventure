@@ -461,6 +461,7 @@ func _copy_healed(d: Dictionary):
 
 func start_pvp(pdicts: Array) -> void:
 	if state == State.BATTLE or party.is_empty() or pdicts.is_empty():
+		coop.send({"t": "forfeit"})
 		return
 	dlg.clear()
 	dlg_text = ""
