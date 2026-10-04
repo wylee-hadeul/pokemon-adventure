@@ -9,8 +9,10 @@ const FieldScript = preload("res://scripts/field.gd")
 const BattleScript = preload("res://scripts/battle.gd")
 const VoiceScript = preload("res://scripts/voice.gd")
 const SfxScript = preload("res://scripts/sfx.gd")
+const SpritesScript = preload("res://scripts/sprites.gd")
+const CoopScript = preload("res://scripts/coop.gd")
 
-enum State { TITLE, CHAR, OAK, STARTER, TOWN, SHOP, CENTER, PARTY, BAG, STAGES, FIELD, MENU, BATTLE, EVOLVE }
+enum State { TITLE, CHAR, OAK, STARTER, TOWN, SHOP, CENTER, PARTY, BAG, STAGES, FIELD, MENU, BATTLE, EVOLVE, LOBBY, FRIEND, TRADE }
 
 var state := State.TITLE
 var view := Vector2(360, 640)
@@ -20,6 +22,12 @@ var sfx
 var field
 var battle
 var ui: Node2D
+var spr
+var coop
+var pending_stage: Array = []   # 친구가 출발한 스테이지 [s, seed]
+var pvp_ret := State.TOWN
+var trade_ret := State.TOWN
+var log_lines: Array = []
 var autoplay := false
 var bot_dir := -1
 var t := 0.0
@@ -74,6 +82,12 @@ func _ready() -> void:
 	font.antialiasing = TextServer.FONT_ANTIALIASING_NONE
 	font.hinting = TextServer.HINTING_NONE
 	font.subpixel_positioning = TextServer.SUBPIXEL_POSITIONING_DISABLED
+	spr = SpritesScript.new()
+	add_child(spr)
+	spr.bake()
+	coop = CoopScript.new()
+	coop.main = self
+	add_child(coop)
 	voice = VoiceScript.new()
 	add_child(voice)
 	sfx = SfxScript.new()
@@ -111,7 +125,7 @@ func _on_resize() -> void:
 func set_state(s: int) -> void:
 	state = s
 	print("[state] ", State.keys()[s])
-	field.visible = s == State.FIELD or s == State.MENU
+	field.visible = s == State.FIELD or s == State.MENU or s == State.FRIEND
 	battle.visible = s == State.BATTLE
 
 
@@ -332,6 +346,14 @@ func open_field_menu() -> void:
 
 
 func on_battle_end(result: String, won: int, kind: String) -> void:
+	if kind == "pvp":
+		print("[pvp] ", result)
+		log_lines.append("pvp " + result)
+		set_state(pvp_ret)
+		field.lock = false
+		var line := "친구와의 대전에서 이겼다!" if result == "win" else ("친구와의 대전에서 졌다... 다음엔 꼭 이기자!" if result == "lose" else "대전이 끝났다.")
+		say([line], character)
+		return
 	money += won
 	print("[battle] ", kind, " ", result, " +", won, "원 money=", money)
 	if result == "lose":
@@ -380,12 +402,103 @@ func _clear_choice(i: int) -> void:
 		go_town()
 
 
-func start_stage(s: int) -> void:
+func start_stage(s: int, sd := -1) -> void:
 	stage = max(1, s)
-	field.setup(stage)
+	var echo := sd < 0
+	if sd < 0:
+		sd = randi() % 1000000
+	field.setup(stage, sd)
 	set_state(State.FIELD)
 	show_toast("스테이지 %d  %s" % [stage, Data.area(stage).name])
+	if echo and coop.connected():
+		coop.send({"t": "stage", "s": stage, "seed": sd})
 	save_game()
+
+
+# ------------------------------------------------------------------ 같이 하기
+
+func partner_stage(s: int, sd: int) -> void:
+	pending_stage = [s, sd]
+
+
+func _can_follow() -> bool:
+	if not started or dlg_busy() or trans_t > 0.0:
+		return false
+	if state == State.FIELD and field.lock:
+		return false
+	return state in [State.TOWN, State.STAGES, State.FIELD, State.MENU, State.FRIEND, State.SHOP, State.CENTER, State.PARTY, State.BAG, State.LOBBY]
+
+
+func partner_request(k: String) -> void:
+	if state in [State.BATTLE, State.EVOLVE, State.TRADE, State.TITLE, State.CHAR, State.OAK, State.STARTER] or trans_t > 0.0 or dlg_busy() or party.is_empty():
+		coop.answer(k, false)
+		return
+	if state == State.FIELD:
+		field.lock = true
+	sfx.play("encounter", -8.0)
+	var what := "대전" if k == "battle" else "교환"
+	ask("친구가 %s을 신청했어! 할까?" % what, ["좋아!", "다음에"], func(i): _answer_req(k, i == 0))
+
+
+func _answer_req(k: String, ok: bool) -> void:
+	if state == State.FIELD:
+		field.lock = false
+	coop.answer(k, ok)
+
+
+func open_friend_menu() -> void:
+	if dlg_busy() or field.lock:
+		return
+	sfx.play("select", -10.0)
+	set_state(State.FRIEND)
+
+
+func _copy_healed(d: Dictionary):
+	var m = Mon.from_dict(d)
+	m.heal_full()
+	return m
+
+
+func start_pvp(pdicts: Array) -> void:
+	if state == State.BATTLE or party.is_empty() or pdicts.is_empty():
+		return
+	dlg.clear()
+	dlg_text = ""
+	choice = []
+	pvp_ret = State.FIELD if field.active and state in [State.FIELD, State.MENU, State.FRIEND] else State.TOWN
+	var mine: Array = party.map(func(m): return _copy_healed(m.to_dict()))
+	var foes: Array = pdicts.map(func(d): return _copy_healed(d))
+	field.lock = true
+	sfx.play("encounter", -6.0)
+	set_state(State.BATTLE)
+	battle.start("pvp", foes, "친구", mine)
+
+
+func open_trade() -> void:
+	dlg.clear()
+	dlg_text = ""
+	choice = []
+	trade_ret = State.FIELD if field.active and state in [State.FIELD, State.MENU, State.FRIEND] else State.TOWN
+	set_state(State.TRADE)
+
+
+func close_trade(msg: String) -> void:
+	if state != State.TRADE:
+		return
+	set_state(trade_ret)
+	field.lock = false
+	say([msg], "")
+
+
+func on_partner_left() -> void:
+	show_toast("친구와 연결이 끊겼어요")
+	pending_stage = []
+	if state == State.BATTLE and battle.pvp:
+		battle.pvp_foe_left()
+	elif state == State.TRADE:
+		close_trade("친구와 연결이 끊겼다.")
+	elif state == State.FRIEND:
+		set_state(State.FIELD)
 
 
 func go_town() -> void:
@@ -454,8 +567,13 @@ func _process(delta: float) -> void:
 		trans_t -= delta
 		if trans_t <= 0.0:
 			_begin_battle()
-	if state == State.FIELD or state == State.MENU:
+	if state == State.FIELD or state == State.MENU or state == State.FRIEND:
 		field.update(delta, bot_dir if not dlg_busy() and trans_t <= 0.0 else -1)
+	if not pending_stage.is_empty() and _can_follow():
+		var ps := pending_stage
+		pending_stage = []
+		start_stage(ps[0], ps[1])
+		say(["친구가 스테이지 %d(으)로 출발했다! 같이 가자!" % ps[0]], "")
 	if evo_t >= 0.0:
 		evo_t += delta
 		if evo_t >= 3.0:
@@ -476,6 +594,12 @@ func _begin_battle() -> void:
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
+		if state == State.LOBBY and event.keycode >= KEY_0 and event.keycode <= KEY_9:
+			press("key:%d" % (event.keycode - KEY_0))
+			return
+		if state == State.LOBBY and event.keycode == KEY_BACKSPACE:
+			press("key:지우기")
+			return
 		if event.keycode in [KEY_SPACE, KEY_ENTER, KEY_Z]:
 			if dlg_busy():
 				advance()
@@ -537,9 +661,10 @@ func buttons() -> Array:
 				out.append(_b("starter_ok", Rect2(24, v.y - 100, bw, 48), "이 포켓몬으로 할래!", Color("43a047")))
 		State.TOWN:
 			var labels := [["adventure", "모험 떠나기", Color("e53935")], ["center", "포켓몬센터", Color("ec407a")], ["shop", "프렌들리숍", Color("1e88e5")],
-				["party", "포켓몬", Color("43a047")], ["bag", "가방", Color("fb8c00")], ["voice", "음성: " + ("켜짐" if voice.enabled else "꺼짐"), Color("607d8b")]]
+				["party", "포켓몬", Color("43a047")], ["bag", "가방", Color("fb8c00")],
+				["coop", "친구와 함께" if coop.connected() else "같이 하기", Color("f9a825")], ["voice", "음성: " + ("켜짐" if voice.enabled else "꺼짐"), Color("607d8b")]]
 			out.append(_b(labels[0][0], Rect2(16, v.y - 262, v.x - 32, 56), labels[0][1], labels[0][2]))
-			for i in range(1, 6):
+			for i in range(1, 7):
 				var k := i - 1
 				out.append(_b(labels[i][0], Rect2(16 + (k % 2) * (v.x * 0.5 - 8), v.y - 198 + (k / 2) * 52, v.x * 0.5 - 24, 46), labels[i][1], labels[i][2]))
 		State.SHOP:
@@ -581,6 +706,33 @@ func buttons() -> Array:
 			var labels2 := [["party", "포켓몬"], ["bag", "가방"], ["town", "마을로 돌아가기"], ["close", "닫기"]]
 			for i in 4:
 				out.append(_b(labels2[i][0], Rect2(v.x - 200, 48 + i * 50, 188, 44), labels2[i][1], Color("37474f") if i < 3 else Color("546e7a")))
+		State.LOBBY:
+			if coop.connected():
+				out.append(_b("req_battle", Rect2(24, 330, bw, 52), "대전 신청", Color("e53935")))
+				out.append(_b("req_trade", Rect2(24, 392, bw, 52), "교환 신청", Color("1e88e5")))
+				out.append(_b("leave", Rect2(24, 454, bw, 44), "연결 끊기", Color("6d4c41")))
+			elif coop.net.status == "hosting" or coop.net.status == "connecting":
+				out.append(_b("leave", Rect2(24, v.y - 150, bw, 48), "취소", Color("6d4c41")))
+			else:
+				out.append(_b("host", Rect2(24, 150, bw, 52), "방 만들기", Color("e53935")))
+				var keys := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "지우기", "0", "참가"]
+				var kw := (v.x - 48 - 16) / 3.0
+				for i in 12:
+					var col := Color("455a64")
+					if keys[i] == "참가":
+						col = Color("43a047") if coop.code_input.length() == 4 else Color("9e9e9e")
+					out.append(_b("key:" + keys[i], Rect2(24 + (i % 3) * (kw + 8), 330 + (i / 3) * 52, kw, 46), keys[i], col))
+			out.append(_b("back", Rect2(v.x - 84, 12, 72, 30), "뒤로", Color("546e7a")))
+		State.FRIEND:
+			var labels3 := [["req_battle", "대전 신청"], ["req_trade", "교환 신청"], ["close", "닫기"]]
+			for i in 3:
+				out.append(_b(labels3[i][0], Rect2(v.x - 200, 48 + i * 50, 188, 44), labels3[i][1], Color("f57f17") if i < 2 else Color("546e7a")))
+		State.TRADE:
+			for i in party.size():
+				out.append(_b("p:%d" % i, Rect2(8, 80 + i * 50, v.x * 0.5 - 12, 46), "", Color(0, 0, 0, 0)))
+			if coop.my_offer >= 0 and coop.their_offer != null and not coop.my_ok:
+				out.append(_b("trade_ok", Rect2(24, v.y - 130, bw, 52), "교환하기!", Color("43a047")))
+			out.append(_b("trade_cancel", Rect2(24, v.y - 68, bw, 44), "그만두기", Color("6d4c41")))
 		State.EVOLVE:
 			if evo_choose:
 				for i in 3:
@@ -655,7 +807,9 @@ func press(id: String) -> void:
 			if voice.enabled:
 				voice.speak("음성을 켰어요!", character)
 		"back":
-			if state == State.BAG and bag_potion:
+			if state == State.LOBBY:
+				set_state(State.TOWN)
+			elif state == State.BAG and bag_potion:
 				bag_potion = false
 			elif state == State.PARTY or state == State.BAG:
 				set_state(ret_state)
@@ -676,6 +830,24 @@ func press(id: String) -> void:
 			go_town()
 		"close":
 			set_state(State.FIELD)
+		"coop":
+			set_state(State.LOBBY)
+		"host":
+			coop.host_room()
+		"leave":
+			coop.leave()
+		"req_battle":
+			coop.request("battle")
+			if state == State.FRIEND:
+				set_state(State.FIELD)
+		"req_trade":
+			coop.request("trade")
+			if state == State.FRIEND:
+				set_state(State.FIELD)
+		"trade_ok":
+			coop.trade_ok()
+		"trade_cancel":
+			coop.trade_cancel()
 		_:
 			if id.begins_with("starter:"):
 				starter_pick = int(id.substr(8))
@@ -685,6 +857,17 @@ func press(id: String) -> void:
 				_buy(id.substr(id.find(":") + 1), n)
 			elif id.begins_with("st:"):
 				stage = clampi(stage + int(id.substr(3)), 1, 9999)
+			elif id.begins_with("key:"):
+				var k := id.substr(4)
+				if k == "지우기":
+					coop.code_input = coop.code_input.substr(0, max(coop.code_input.length() - 1, 0))
+				elif k == "참가":
+					if coop.code_input.length() == 4:
+						coop.join_room(coop.code_input)
+				elif coop.code_input.length() < 4:
+					coop.code_input += k
+			elif id.begins_with("p:") and state == State.TRADE:
+				coop.offer(int(id.substr(2)))
 			elif id.begins_with("p:"):
 				_party_tap(int(id.substr(2)))
 			elif id.begins_with("x:"):
@@ -781,7 +964,7 @@ func _hp_bar(p: Vector2, w: float, m) -> void:
 
 func _mon_row(r: Rect2, m, hl: bool) -> void:
 	_panel(r, Color("ffe082") if hl else (Color("e0e0e0") if m.fainted() else Color("f8f8f8")))
-	Px.mon(ui, m.id, r.position + Vector2(26, r.size.y - 4), 0.75)
+	spr.mon(ui, m.id, r.position + Vector2(28, r.size.y), 1)
 	_txt(r.position + Vector2(56, 18), m.name())
 	_txt(r.position + Vector2(140, 18), "Lv%d" % m.level)
 	var tx := 190.0
@@ -809,6 +992,11 @@ func _draw_ui() -> void:
 			_panel(Rect2(v.x - 208, 40, 204, 212))
 			_txt(Vector2(16, 30), "돈 %d원" % money, 11, Color.WHITE)
 		State.EVOLVE: _draw_evolve()
+		State.LOBBY: _draw_lobby()
+		State.TRADE: _draw_trade()
+		State.FRIEND:
+			ui.draw_rect(Rect2(Vector2.ZERO, v), Color(0, 0, 0, 0.35))
+			_panel(Rect2(v.x - 208, 40, 204, 162))
 	if state == State.SHOP:
 		_draw_shop()
 	for b in buttons():
@@ -852,9 +1040,9 @@ func _draw_title() -> void:
 	_ctxt(148, "포켓몬 모험", 44, Color("ffcb05"))
 	_ctxt(180, "~ 끝없는 스테이지 ~", 11, Color("1a3f8f"))
 	var bob := sin(t * 3.0) * 3.0
-	Px.mon(ui, "pikachu", Vector2(v.x * 0.5 - 60, v.y * 0.55 + 30 + bob), 2.2)
-	Px.mon(ui, "charmander", Vector2(v.x * 0.5 + 70, v.y * 0.55 + 34 - bob), 1.8)
-	Px.ball(ui, Vector2(v.x * 0.5 + 6, v.y * 0.55 - 30 + bob * 2.0), "pokeball", 14.0)
+	spr.mon(ui, "pikachu", Vector2(v.x * 0.5 - 70, v.y * 0.55 + 40 + bob), 3)
+	spr.mon(ui, "charmander", Vector2(v.x * 0.5 + 76, v.y * 0.55 + 40 - bob), 3)
+	spr.ball(ui, "pokeball", Vector2(v.x * 0.5 + 4, v.y * 0.55 - 40 + bob * 2.0), 2)
 	if int(t * 2.0) % 2 == 0:
 		_ctxt(v.y - 220, "버튼을 눌러 시작하세요", 11, Color("1b3a1b"))
 
@@ -871,7 +1059,7 @@ func _draw_char() -> void:
 		if sel:
 			ui.draw_rect(r.grow(-4), Color("e53935"), false, 2.0)
 		var bob := sin(t * 5.0) * 3.0 if sel else 0.0
-		Px.trainer(ui, r.position + Vector2(r.size.x * 0.5, 230 + bob), o[0] == "f", 2.6)
+		spr.person(ui, spr.walker_key(o[0], 0, int(t * 4.0) if sel else 0), r.position + Vector2(r.size.x * 0.5, 240), 8)
 		_txt(r.position + Vector2(0, 274), o[1], 22, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, r.size.x)
 
 
@@ -887,26 +1075,26 @@ func _draw_lab() -> void:
 	ui.draw_rect(Rect2(v.x - 90, 20, 70, 50), Color("90caf9"))
 	_ctxt(54, "오박사 연구소", 22, Color.WHITE)
 	if state == State.OAK:
-		Px.oak(ui, Vector2(v.x * 0.5, 320), 3.0)
-		Px.trainer(ui, Vector2(v.x * 0.5 + 100, 420), character == "f", 1.6, true)
+		spr.person(ui, "oak", Vector2(v.x * 0.5, 330), 8)
+		spr.person(ui, spr.walker_key(character, 2, 0), Vector2(v.x * 0.5 + 110, 430), 5)
 		return
 	# 테이블 위 몬스터볼 5개
 	ui.draw_rect(Rect2(24, 260, v.x - 48, 140), Color("8d6e63"))
 	ui.draw_rect(Rect2(24, 260, v.x - 48, 140), Color("4e342e"), false, 2.0)
 	if starter_pick < 0:
-		Px.oak(ui, Vector2(v.x * 0.5, 250), 1.6)
+		spr.person(ui, "oak", Vector2(v.x * 0.5, 256), 4)
 	for i in 5:
 		var r := _starter_rect(i)
 		var c := r.get_center()
 		var sel := starter_pick == i
-		Px.ball(ui, c + Vector2(0, -6.0 + (sin(t * 8.0) * 3.0 if sel else 0.0)), "pokeball", 13.0)
+		spr.ball(ui, "pokeball", c + Vector2(0, -6.0 + (round(sin(t * 8.0) * 2.0) * 2.0 if sel else 0.0)), 2)
 		if sel:
 			ui.draw_rect(r, Color("ffeb3b"), false, 2.0)
 	if starter_pick >= 0:
 		var sp: String = Data.STARTERS[starter_pick]
 		var d: Dictionary = Data.MONS[sp]
 		_panel(Rect2(24, 100, v.x - 48, 140), Color("fffde7"))
-		Px.mon(ui, sp, Vector2(90, 220 + sin(t * 4.0) * 2.0), 2.4)
+		spr.mon(ui, sp, Vector2(90, 228), 2)
 		_txt(Vector2(160, 140), d.name, 22)
 		var tx := 160.0
 		for ty in d.types:
@@ -935,17 +1123,20 @@ func _draw_town() -> void:
 	_panel(Rect2(v.x - 150, 8, 142, 50), Color("fffde7"))
 	_txt(Vector2(v.x - 142, 28), "돈  %d원" % money)
 	_txt(Vector2(v.x - 142, 48), "배지  %d개" % best_stage)
-	Px.trainer(ui, Vector2(v.x * 0.5, 320), character == "f", 1.4)
+	spr.person(ui, spr.walker_key(character, 0, 0), Vector2(v.x * 0.5, 324), 4)
+	if coop.connected():
+		spr.person(ui, spr.walker_key(coop.p_char + "2", 0, 0), Vector2(v.x * 0.5 - 70, 324), 4)
+		_txt(Vector2(v.x * 0.5 - 100, 254), "친구", 11, Color("e65100"), HORIZONTAL_ALIGNMENT_CENTER, 60)
 	for i in party.size():
 		var px := v.x * 0.5 + (i - (party.size() - 1) * 0.5) * 50.0 + (40.0 if party.size() == 1 else 0.0)
-		Px.mon(ui, party[i].id, Vector2(px, 368 + sin(t * 3.0 + i) * 2.0), 0.7)
+		spr.mon(ui, party[i].id, Vector2(px, 372), 1)
 	if state == State.CENTER:
 		ui.draw_rect(Rect2(Vector2.ZERO, v), Color(1, 0.92, 0.95, 0.92))
 		_ctxt(80, "포켓몬센터", 22, Color("c2185b"))
-		Px.trainer(ui, Vector2(v.x * 0.5, 240), true, 2.0)
+		spr.person(ui, "nurse_0_0", Vector2(v.x * 0.5, 240), 6)
 		for i in party.size():
 			var m = party[i]
-			Px.ball(ui, Vector2(v.x * 0.5 - 75 + i * 30, 270), "pokeball", 9.0)
+			spr.ball(ui, "pokeball", Vector2(v.x * 0.5 - 75 + i * 30, 270), 1)
 			_hp_bar(Vector2(v.x * 0.5 - 87 + i * 30, 284), 24, m)
 
 
@@ -971,7 +1162,7 @@ func _draw_shop() -> void:
 		var r := Rect2(16, 106 + i * 70, v.x - 32, 66)
 		_panel(r)
 		if Data.BALLS.has(it):
-			Px.ball(ui, r.position + Vector2(26, 33), it, 12.0)
+			spr.ball(ui, it, r.position + Vector2(26, 33), 2)
 		else:
 			ui.draw_rect(Rect2(r.position + Vector2(16, 18), Vector2(20, 30)), d.col)
 			ui.draw_rect(Rect2(r.position + Vector2(20, 12), Vector2(12, 8)), Color("9e9e9e"))
@@ -991,7 +1182,7 @@ func _draw_party() -> void:
 	for i in min(box.size(), 24):
 		var r := Rect2(8 + (i % 6) * ((v.x - 16) / 6.0), by + (i / 6) * 50, (v.x - 16) / 6.0 - 4, 46)
 		_panel(r, Color("ffe082") if party_sel == 100 + i else Color("fafafa"))
-		Px.mon(ui, box[i].id, r.position + Vector2(r.size.x * 0.5, 36), 0.65)
+		spr.mon(ui, box[i].id, r.position + Vector2(r.size.x * 0.5, 40), 1)
 		_txt(r.position + Vector2(2, 44), "Lv%d" % box[i].level, 11)
 
 
@@ -1009,7 +1200,7 @@ func _draw_bag() -> void:
 		var r := Rect2(8, 70 + i * 52, v.x - 16, 46)
 		_panel(r)
 		if Data.BALLS.has(it):
-			Px.ball(ui, r.position + Vector2(22, 23), it, 10.0)
+			spr.ball(ui, it, r.position + Vector2(22, 23), 2)
 		else:
 			ui.draw_rect(Rect2(r.position + Vector2(14, 10), Vector2(16, 26)), Data.ITEMS[it].col)
 		_txt(r.position + Vector2(44, 20), Data.ITEMS[it].name, 11)
@@ -1036,11 +1227,80 @@ func _draw_stages() -> void:
 	_ctxt(350, "나오는 포켓몬", 11)
 	for i in pool.size():
 		var x: float = v.x * 0.5 + (i - (pool.size() - 1) * 0.5) * 60.0
-		Px.mon(ui, pool[i], Vector2(x, 410), 0.9)
+		spr.mon(ui, pool[i], Vector2(x, 412), 1)
 		_txt(Vector2(x - 30, 426), Data.MONS[pool[i]].name, 11, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, 60)
 	var my = first_healthy()
 	if my != null and my.level + 3 < lv:
 		_ctxt(456, "※ 내 포켓몬보다 많이 강할 수 있어요!", 11, Color("c62828"))
+
+
+func _draw_lobby() -> void:
+	var v := view
+	ui.draw_rect(Rect2(Vector2.ZERO, v), Color("fff8e1"))
+	_txt(Vector2(12, 34), "같이 하기", 22, Color("e65100"))
+	var st: String = coop.net.status
+	if not coop.net.available:
+		_ctxt(80, "같이 하기는 웹(브라우저)에서만 돼요", 11, Color("c62828"))
+	if coop.connected():
+		_ctxt(80, "친구와 연결됐어요!  (방 코드 %s)" % coop.code, 11, Color("2e7d32"))
+		spr.person(ui, spr.walker_key(character, 0, 0), Vector2(v.x * 0.5 - 70, 200), 5)
+		spr.person(ui, spr.walker_key(coop.p_char + "2", 0, 0), Vector2(v.x * 0.5 + 70, 200), 5)
+		_txt(Vector2(v.x * 0.5 - 110, 218), "나", 11, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, 80)
+		_txt(Vector2(v.x * 0.5 + 30, 218), "친구", 11, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, 80)
+		for i in coop.p_party.size():
+			var d: Dictionary = coop.p_party[i]
+			spr.mon(ui, d.id, Vector2(v.x * 0.5 - (coop.p_party.size() - 1) * 26 + i * 52, 290), 1)
+			_txt(Vector2(v.x * 0.5 - (coop.p_party.size() - 1) * 26 + i * 52 - 26, 306), "Lv%d" % int(d.lv), 11, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, 52)
+		_ctxt(520, "모험을 떠나면 친구도 같은 스테이지로 따라와요!", 11, Color("5d4037"))
+		_ctxt(538, "필드에서도 [친구] 버튼으로 대전/교환을 할 수 있어요", 11, Color("5d4037"))
+		return
+	if st == "hosting":
+		_ctxt(150, "방을 만들었어요! 친구에게 코드를 알려 주세요", 11)
+		_panel(Rect2(60, 180, v.x - 120, 100), Color("ffecb3"))
+		_ctxt(250, coop.code, 44, Color("e65100"))
+		if int(t * 2.0) % 2 == 0:
+			_ctxt(320, "친구를 기다리는 중...", 11)
+		return
+	if st == "connecting":
+		_ctxt(250, "연결하는 중...", 22)
+		return
+	_ctxt(80, "방을 만들거나, 친구 방 코드 4자리를 넣고 참가하세요", 11)
+	if st == "error":
+		_ctxt(110, "연결 실패: %s  (코드를 확인하고 다시 해 보세요)" % coop.net.error, 11, Color("c62828"))
+	_panel(Rect2(60, 230, v.x - 120, 76), Color("eceff1"))
+	for i in 4:
+		var ch: String = coop.code_input[i] if i < coop.code_input.length() else "_"
+		_txt(Vector2(80 + i * (v.x - 160) / 4.0, 286), ch, 44, Color("37474f"), HORIZONTAL_ALIGNMENT_CENTER, (v.x - 160) / 4.0)
+	_ctxt(222, "친구 방 코드", 11)
+
+
+func _draw_trade() -> void:
+	var v := view
+	ui.draw_rect(Rect2(Vector2.ZERO, v), Color("e1f5fe"))
+	_txt(Vector2(12, 34), "포켓몬 교환", 22, Color("0277bd"))
+	_txt(Vector2(12, 66), "보낼 포켓몬을 고르세요", 11)
+	for i in party.size():
+		var r := Rect2(8, 80 + i * 50, v.x * 0.5 - 12, 46)
+		var m = party[i]
+		_panel(r, Color("ffe082") if coop.my_offer == i else Color("fafafa"))
+		spr.mon(ui, m.id, r.position + Vector2(28, 46), 1)
+		_txt(r.position + Vector2(58, 20), m.name())
+		_txt(r.position + Vector2(58, 38), "Lv%d" % m.level)
+	var pr := Rect2(v.x * 0.5 + 4, 80, v.x * 0.5 - 12, 200)
+	_panel(pr, Color("f3e5f5"))
+	_txt(pr.position + Vector2(0, 20), "친구가 보낼 포켓몬", 11, Color("6a1b9a"), HORIZONTAL_ALIGNMENT_CENTER, pr.size.x)
+	if coop.their_offer != null:
+		var d: Dictionary = coop.their_offer
+		spr.mon(ui, d.id, pr.position + Vector2(pr.size.x * 0.5, 150), 2)
+		_txt(pr.position + Vector2(0, 172), "%s  Lv%d" % [Data.MONS[d.id].name, int(d.lv)], 11, Color("303030"), HORIZONTAL_ALIGNMENT_CENTER, pr.size.x)
+	else:
+		_txt(pr.position + Vector2(0, 110), "고르는 중...", 11, Color("757575"), HORIZONTAL_ALIGNMENT_CENTER, pr.size.x)
+	var stt := ""
+	if coop.my_ok and not coop.their_ok:
+		stt = "친구의 확인을 기다리는 중..."
+	elif coop.their_ok and not coop.my_ok:
+		stt = "친구는 준비됐어요! [교환하기]를 누르세요"
+	_ctxt(v.y - 146, stt, 11, Color("2e7d32"))
 
 
 func _draw_evolve() -> void:
@@ -1054,7 +1314,7 @@ func _draw_evolve() -> void:
 		for i in 3:
 			var r := Rect2(12 + i * (v.x - 24) / 3.0, 300, (v.x - 24) / 3.0 - 8, 120)
 			_panel(r, Color("263238"), Color("ffeb3b"))
-			Px.mon(ui, Data.EEVEELUTIONS[i], r.position + Vector2(r.size.x * 0.5, 90), 1.3)
+			spr.mon(ui, Data.EEVEELUTIONS[i], r.position + Vector2(r.size.x * 0.5, 100), 2)
 			_txt(r.position + Vector2(0, 112), Data.MONS[Data.EEVEELUTIONS[i]].name, 11, Color.WHITE, HORIZONTAL_ALIGNMENT_CENTER, r.size.x)
 		return
 	var id: String = evo_mon.id
@@ -1066,6 +1326,6 @@ func _draw_evolve() -> void:
 		for i in 12:
 			var a := t * 2.0 + i * TAU / 12.0
 			ui.draw_circle(c + Vector2(cos(a), sin(a)) * (60.0 + evo_t * 30.0) + Vector2(0, -40), 3.0, Color(1, 1, 0.7, 0.8))
-		Px.mon(ui, id, c, 3.0, false, Color(1, 1, 1) if evo_t < 0.5 else Color(1.6, 1.6, 1.6))
+		spr.mon(ui, id, c, 3, false, evo_t > 0.5 and evo_t < 2.7)
 	else:
-		Px.mon(ui, id, c, 3.0)
+		spr.mon(ui, id, c, 3)

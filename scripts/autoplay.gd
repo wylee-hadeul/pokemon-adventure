@@ -21,6 +21,15 @@ var cleared := 0
 var shopped := false
 var path_fail := 0
 var evo_test := false
+var role := ""          # 같이 하기 테스트: host / join
+var room := ""
+var join_cd := 0.0
+var field_t := 0.0
+var pvp_done := false
+var trade_done := false
+var events: Array = []
+var pub_t := 0.0
+var req_cd := 0.0
 
 
 func _ready() -> void:
@@ -43,8 +52,42 @@ func _ready() -> void:
 			evo_test = true
 		elif a.begins_with("--start="):
 			start_stage = int(a.substr(8))
+	if OS.has_feature("web"):
+		var q := str(JavaScriptBridge.eval("location.search", true))
+		for part in q.trim_prefix("?").split("&"):
+			if part.begins_with("host="):
+				role = "host"
+				room = part.substr(5)
+			elif part.begins_with("join="):
+				role = "join"
+				room = part.substr(5)
+			elif part == "fresh":
+				DirAccess.remove_absolute(ProjectSettings.globalize_path("user://save_autoplay.cfg"))
+				main.new_game()
+		if role == "join":
+			char_pref = "f"
+			starter_pref = 3
+		time_limit = 9999.0
 	if FileAccess.file_exists("user://save_autoplay.cfg") == false:
 		main.load_game()
+
+
+func ev(s: String) -> void:
+	events.append(s)
+	print("[autoplay] ", s)
+	if events.size() > 40:
+		events.pop_front()
+
+
+func _publish() -> void:
+	if not OS.has_feature("web"):
+		return
+	var b = main.battle
+	var info := {"state": main.State.keys()[main.state], "net": main.coop.net.status, "partner": main.coop.partner,
+		"mode": b.mode if main.state == main.State.BATTLE else "", "text": b.text if main.state == main.State.BATTLE else main.dlg_text,
+		"stage": main.field.stage, "seed": main.field.seed, "p_where": main.coop.p_where, "p_stage": main.coop.p_stage,
+		"party": main.party.map(func(m): return "%s Lv%d %d/%d" % [m.name(), m.level, m.hp, m.max_hp()]), "events": events, "log": main.log_lines}
+	JavaScriptBridge.eval("window.__pk = %s;" % JSON.stringify(info), true)
 
 
 func shot(tag: String) -> void:
@@ -63,9 +106,22 @@ func _process(delta: float) -> void:
 		get_tree().quit()
 		return
 	var S = main.State
+	pub_t -= delta
+	if pub_t <= 0.0:
+		pub_t = 1.0
+		_publish()
 	if main.state != last_state:
 		last_state = main.state
+		ev("state " + S.keys()[main.state] + (" pvp" if main.state == S.BATTLE and main.battle.pvp else ""))
 		shot(S.keys()[main.state])
+	if main.state == S.FIELD:
+		field_t += delta
+	join_cd -= delta
+	req_cd -= delta
+	if main.state == S.BATTLE and main.battle.pvp:
+		pvp_done = true
+	if main.state == S.TRADE:
+		trade_done = true
 	if main.state == S.BATTLE and main.battle.mode != last_mode:
 		last_mode = main.battle.mode
 		if last_mode in ["menu", "moves", "bag", "party"] and shot_n < 60:
@@ -78,7 +134,7 @@ func _process(delta: float) -> void:
 		m.exp = m.exp_for(25) - 5
 		m.heal_full()
 		print("[autoplay] evo test: ", m.name(), " Lv24")
-	if main.state == S.FIELD and not main.dlg_busy():
+	if main.state == S.FIELD and not main.dlg_busy() and role != "join":
 		main.bot_dir = _field_dir()
 	cd -= delta
 	if cd > 0.0:
@@ -118,7 +174,33 @@ func _process(delta: float) -> void:
 			else:
 				shot("starter_pick")
 				main.press("starter_ok")
+		S.LOBBY:
+			if main.coop.connected():
+				main.press("back")
+		S.FRIEND:
+			main.press("close")
+		S.TRADE:
+			var c = main.coop
+			if c.my_offer < 0:
+				main.press("p:0")
+				ev("trade offer " + main.party[0].name())
+			elif c.their_offer != null and not c.my_ok:
+				main.press("trade_ok")
 		S.TOWN:
+			if role != "" and not main.coop.connected():
+				_coop_connect()
+				return
+			if role == "join":
+				# 참가자는 마을에서 기다리면 방장의 스테이지로 따라간다
+				var hurt2 := false
+				for m in main.party:
+					if m.hp < m.max_hp():
+						hurt2 = true
+				if hurt2:
+					main.press("center")
+				elif not shopped:
+					main.press("shop")
+				return
 			var hurt := false
 			for m in main.party:
 				if m.hp < m.max_hp():
@@ -160,6 +242,32 @@ func _process(delta: float) -> void:
 				main.press("evo:1")
 		S.BATTLE:
 			_battle()
+		S.FIELD:
+			if role == "host" and main.coop.connected() and not main.field.lock and not main.dlg_busy():
+				if req_cd > 0.0 or main.coop.pending_req != "":
+					pass
+				elif not pvp_done and field_t > 6.0:
+					req_cd = 8.0
+					ev("request battle")
+					main.coop.request("battle")
+				elif pvp_done and not trade_done:
+					req_cd = 8.0
+					ev("request trade")
+					main.coop.request("trade")
+
+
+func _coop_connect() -> void:
+	var c = main.coop
+	if join_cd > 0.0:
+		return
+	join_cd = 4.0
+	if role == "host" and c.net.status != "hosting":
+		c.code = room
+		c.net.host(room)
+		ev("hosting " + room)
+	elif role == "join" and c.net.status != "connecting":
+		c.join_room(room)
+		ev("joining " + room)
 
 
 func _battle() -> void:
@@ -172,7 +280,9 @@ func _battle() -> void:
 		"menu":
 			var e = b.enemy
 			var me = b.me
-			if me.hp < me.max_hp() * 0.3 and main.items.get("potion", 0) > 0:
+			if b.pvp:
+				b.press("fight")
+			elif me.hp < me.max_hp() * 0.3 and main.items.get("potion", 0) > 0:
 				b.press("bag")
 			elif b.kind == "wild" and main.party.size() < 6 and e.hp < e.max_hp() * 0.6 and _ball() != "":
 				b.press("bag")
@@ -199,8 +309,8 @@ func _battle() -> void:
 					best = i
 			b.press("move:%d" % best)
 		"party":
-			for i in main.party.size():
-				if not main.party[i].fainted() and main.party[i] != b.me:
+			for i in b.my_party.size():
+				if not b.my_party[i].fainted() and b.my_party[i] != b.me:
 					b.press("mon:%d" % i)
 					return
 			b.press("back")

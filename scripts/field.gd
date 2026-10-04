@@ -28,12 +28,15 @@ var active := false
 var lock := false             # 대화/배틀 중 이동 금지
 var t := 0.0
 var cam_y := 0.0
+var cam := Vector2.ZERO
+var seed := 0
 
 
-func setup(s: int) -> void:
+func setup(s: int, sd: int) -> void:
 	stage = s
+	seed = sd
 	area = Data.area(s)
-	rng.randomize()
+	rng.seed = sd  # 같은 시드면 친구와 똑같은 맵
 	tiles = PackedByteArray()
 	tiles.resize(W * H)
 	tiles.fill(GROUND)
@@ -119,10 +122,11 @@ func setup(s: int) -> void:
 			if _tile(ip.x, ip.y) == GROUND or _tile(ip.x, ip.y) == FLOWER:
 				items.append({"pos": ip, "item": item_pool[rng.randi() % item_pool.size()], "taken": false})
 				break
+	rng.randomize()  # 야생 만남은 각자 따로
 	active = true
 	lock = false
 	held = -1
-	cam_y = pos.y * T
+	cam = Vector2(pos) * T + Vector2(8, 8)
 
 
 func _inside(c: Vector2i) -> bool:
@@ -155,6 +159,10 @@ func menu_rect() -> Rect2:
 	return Rect2(main.view.x - 70, 8, 62, 26)
 
 
+func friend_rect() -> Rect2:
+	return Rect2(main.view.x - 140, 8, 62, 26)
+
+
 func _dir_from(v: Vector2) -> int:
 	if v.length() < 10.0:
 		return -1
@@ -171,6 +179,10 @@ func _input(event: InputEvent) -> void:
 		if event.pressed:
 			if menu_rect().has_point(event.position):
 				main.open_field_menu()
+				get_viewport().set_input_as_handled()
+				return
+			if main.coop.connected() and friend_rect().has_point(event.position):
+				main.open_friend_menu()
 				get_viewport().set_input_as_handled()
 				return
 			if event.position.distance_to(dpad_center()) < 80.0:
@@ -203,9 +215,9 @@ const DIRS := [Vector2i(0, 1), Vector2i(1, 0), Vector2i(0, -1), Vector2i(-1, 0)]
 func update(delta: float, bot_dir := -1) -> void:
 	t += delta
 	draw_pos = draw_pos.move_toward(Vector2(pos), delta / 0.15)
-	cam_y = lerp(cam_y, draw_pos.y * T, min(1.0, delta * 10.0))
+	cam = cam.lerp(draw_pos * T + Vector2(8, 8), min(1.0, delta * 10.0))
 	move_cd -= delta
-	if lock or main.state != main.State.FIELD:
+	if lock or main.state != main.State.FIELD or main.dlg_busy():
 		queue_redraw()
 		return
 	var d := held
@@ -264,68 +276,72 @@ func _in_sight(n: Dictionary) -> bool:
 
 # ------------------------------------------------------------------ 그리기
 
+const Z := 2  # 필드 확대 배율 (도트가 크게 보이게)
+
+
 func _draw() -> void:
 	if not active:
 		return
 	var v: Vector2 = main.view
-	var ox := (v.x - W * T) * 0.5
 	var view_h: float = v.y - 200.0  # 아래 200px는 조작판
-	var oy: float = clamp(view_h * 0.55 - cam_y, view_h - H * T, 40.0)
-	var y0: int = max(0, int(-oy / T) - 1)
-	var y1: int = min(H, int((v.y - oy) / T) + 2)
-	var g: Color = area.ground
+	var tz := T * Z
+	var off := Vector2(v.x * 0.5 - cam.x * Z, 40.0 + (view_h - 40.0) * 0.5 - cam.y * Z)
+	off.x = clamp(off.x, v.x - W * tz, 0.0)
+	off.y = clamp(off.y, view_h - H * tz, 40.0)
+	off = off.round()
 	draw_rect(Rect2(Vector2.ZERO, v), area.tree.darkened(0.3))
+	var tx: Dictionary = main.spr.tiles(area)
+	var x0: int = max(0, int(-off.x / tz))
+	var x1: int = min(W, int((v.x - off.x) / tz) + 1)
+	var y0: int = max(0, int(-off.y / tz))
+	var y1: int = min(H, int((view_h - off.y) / tz) + 1)
+	draw_set_transform(off, 0.0, Vector2(Z, Z))
 	for y in range(y0, y1):
-		for x in W:
-			var p := Vector2(ox + x * T, oy + y * T)
+		for x in range(x0, x1):
+			var r := Rect2(x * T, y * T, T, T)
 			var tt := tiles[y * W + x]
-			draw_rect(Rect2(p, Vector2(T, T)), g if (x + y) % 2 == 0 else g.darkened(0.04))
+			if x == W / 2 and y == 1:
+				tt = PATH  # 출구
+			var odd := (x + y) % 2
+			var tex: Texture2D = tx.ground0 if odd == 0 else tx.ground1
 			match tt:
-				PATH:
-					draw_rect(Rect2(p, Vector2(T, T)), Color("e6d3a3"))
-					if (x * 7 + y * 3) % 5 == 0:
-						draw_rect(Rect2(p + Vector2(5, 6), Vector2(2, 2)), Color("c9b27c"))
-				GRASS:
-					var gc: Color = area.grass
-					draw_rect(Rect2(p, Vector2(T, T)), gc)
-					for i in 3:
-						var bx := p.x + 2 + i * 5
-						draw_colored_polygon(PackedVector2Array([Vector2(bx, p.y + 14), Vector2(bx + 2, p.y + 4 + (i % 2) * 2), Vector2(bx + 4, p.y + 14)]), gc.darkened(0.3))
-				TREE:
-					var tc: Color = area.tree
-					draw_rect(Rect2(p + Vector2(6, 10), Vector2(4, 6)), Color("6d4c41"))
-					draw_circle(p + Vector2(8, 7), 7.5, tc.darkened(0.25))
-					draw_circle(p + Vector2(8, 6), 6.5, tc)
-					draw_circle(p + Vector2(6, 4), 2.0, tc.lightened(0.2))
-				ROCK:
-					draw_circle(p + Vector2(8, 9), 7.0, Color("5d5d55"))
-					draw_circle(p + Vector2(8, 8), 6.0, Color("8d8d80"))
-				FLOWER:
-					for fp in [Vector2(4, 5), Vector2(11, 10)]:
-						draw_circle(p + fp, 2.0, Color("ff8a80") if (x + y) % 2 == 0 else Color("fff59d"))
-						draw_circle(p + fp, 0.8, Color("ffeb3b"))
-	# 출구 표시 (관장 뒤)
-	var ex := Vector2(ox + (W / 2) * T, oy + 1 * T)
-	draw_rect(Rect2(ex, Vector2(T, T)), Color("e6d3a3"))
+				PATH: tex = tx.path
+				GRASS: tex = tx.grass
+				TREE: tex = tx.tree
+				ROCK: tex = tx.rock
+				FLOWER: tex = tx.flower0 if odd == 0 else tx.flower1
+			draw_texture_rect(tex, r, false)
 	# 아이템
 	for it in items:
 		if not it.taken:
-			Px.ball(self, Vector2(ox + it.pos.x * T + 8, oy + it.pos.y * T + 9), "pokeball", 5.0)
+			main.spr.ball(self, "pokeball", Vector2(it.pos.x * T + 8, it.pos.y * T + 8), 1)
 	# NPC
 	for n in npcs:
-		var np := Vector2(ox + n.pos.x * T, oy + n.pos.y * T)
-		var col := Color("8e24aa") if n.kind == "leader" else Color("43a047")
-		Px.walker(self, np, col, Color("3e2723"), n.dir, 0)
+		var np := Vector2(n.pos.x * T, n.pos.y * T)
+		main.spr.person(self, main.spr.walker_key("leader" if n.kind == "leader" else "trainer", n.dir, 0), np + Vector2(8, 15), 1)
+	# 친구
+	var fp := Vector2(-999, -999)
+	if main.coop.partner_on_my_map():
+		var c2: Vector2 = main.coop.p_draw
+		fp = Vector2(c2.x * T, c2.y * T)
+		var moving: bool = c2.distance_to(Vector2(main.coop.p_pos)) > 0.05
+		main.spr.person(self, main.spr.walker_key(main.coop.p_char + "2", main.coop.p_dir, main.coop.p_step if moving else 0), fp + Vector2(8, 15), 1)
+	# 플레이어
+	var pp := Vector2(draw_pos.x * T, draw_pos.y * T)
+	var moving_me := draw_pos.distance_to(Vector2(pos)) > 0.05
+	main.spr.person(self, main.spr.walker_key(main.character, dir, step_n if moving_me else 0), pp + Vector2(8, 15), 1)
+	if _tile(pos.x, pos.y) == GRASS and not moving_me:
+		draw_texture_rect_region(tx.grass, Rect2(pp + Vector2(0, 10), Vector2(16, 6)), Rect2(0, 10, 16, 6))
+	draw_set_transform(Vector2.ZERO, 0.0, Vector2.ONE)
+	# 이름표 (화면 좌표)
+	for n in npcs:
 		if not n.beaten and n.kind == "leader":
 			var a: float = 0.5 + 0.5 * sin(t * 4.0)
-			draw_string(main.font, np + Vector2(-2, -4), "관장", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 0.5, a))
-	# 플레이어
-	var pp := Vector2(ox + draw_pos.x * T, oy + draw_pos.y * T)
-	var on_grass := _tile(pos.x, pos.y) == GRASS
-	Px.walker(self, pp, Color("e53935") if main.character == "m" else Color("4fb3a9"), Color("5a3825") if main.character == "f" else Color("c62828"), dir, step_n)
-	if on_grass:
-		var gc: Color = area.grass
-		draw_rect(Rect2(pp + Vector2(2, 11), Vector2(12, 5)), gc)
+			draw_string(main.font, off + Vector2(n.pos.x * T - 3, n.pos.y * T - 3) * Z, "관장", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 0.5, a))
+	if fp.x > -999:
+		var sp := off + fp * Z + Vector2(4, -6)
+		draw_rect(Rect2(sp + Vector2(-2, -11), Vector2(28, 14)), Color(0, 0, 0, 0.55))
+		draw_string(main.font, sp, "친구", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color("fff59d"))
 	# 상단 정보 + 메뉴 버튼
 	draw_rect(Rect2(0, 0, v.x, 40), Color(0, 0, 0, 0.45))
 	draw_string(main.font, Vector2(10, 26), "스테이지 %d  %s" % [stage, area.name], HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color.WHITE)
@@ -333,6 +349,11 @@ func _draw() -> void:
 	draw_rect(mr, Color("37474f"))
 	draw_rect(mr, Color.WHITE, false, 1.0)
 	draw_string(main.font, mr.position + Vector2(16, 18), "메뉴", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color.WHITE)
+	if main.coop.connected():
+		var fr := friend_rect()
+		draw_rect(fr, Color("f9a825"))
+		draw_rect(fr, Color.WHITE, false, 1.0)
+		draw_string(main.font, fr.position + Vector2(16, 18), "친구", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color.WHITE)
 	# 조작판 (게임기 몸체 느낌)
 	draw_rect(Rect2(0, v.y - 200, v.x, 200), Color("c62828"))
 	draw_rect(Rect2(0, v.y - 200, v.x, 4), Color("8e0000"))
@@ -340,7 +361,7 @@ func _draw() -> void:
 	draw_string(main.font, Vector2(v.x - 170, v.y - 94), "야생 포켓몬이 나와요!", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 1, 0.8))
 	draw_string(main.font, Vector2(v.x - 170, v.y - 70), "맨 위의 관장을 이기면", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 1, 0.8))
 	draw_string(main.font, Vector2(v.x - 170, v.y - 54), "스테이지 클리어!", HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color(1, 1, 1, 0.8))
-	Px.ball(self, Vector2(v.x - 40, v.y - 160), "pokeball", 14.0)
+	main.spr.ball(self, "pokeball", Vector2(v.x - 40, v.y - 160), 2)
 	# 방향키
 	var c := dpad_center()
 	draw_circle(c, 62.0, Color(0, 0, 0, 0.25))

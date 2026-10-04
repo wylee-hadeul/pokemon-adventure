@@ -32,15 +32,27 @@ var money_won := 0
 var rng := RandomNumberGenerator.new()
 var t := 0.0
 var escape_tries := 0
+var my_party: Array = []
+var pvp := false
+var pvp_my_act = null       # 방장: 내 행동 / 참가자: 보냈음 표시
+var pvp_foe_act = null
+var pvp_pending_sw := -1    # 친구가 먼저 보낸 교체 (연출이 거기까지 오기 전)
+var waiting_foe_sw := false
 
 
-func start(k: String, foes: Array, tname := "") -> void:
+func start(k: String, foes: Array, tname := "", mine: Array = []) -> void:
 	rng.randomize()
 	kind = k
+	pvp = k == "pvp"
+	my_party = mine if not mine.is_empty() else main.party
+	pvp_my_act = null
+	pvp_foe_act = null
+	pvp_pending_sw = -1
+	waiting_foe_sw = false
 	trainer_name = tname
 	enemy_party = foes
 	enemy = foes[0]
-	me = main.first_healthy()
+	me = _first_healthy()
 	e_hp = enemy.hp
 	p_hp = me.hp
 	steps.clear()
@@ -55,8 +67,11 @@ func start(k: String, foes: Array, tname := "") -> void:
 		_msg("앗! 야생 %s(이)가 튀어나왔다!" % enemy.name())
 		_do(_enemy_cry)
 	else:
-		var line := "내가 이 지역의 관장이다! 실력을 보여 줘!" if kind == "leader" else "눈이 마주치면 포켓몬 승부지!"
-		_msg("%s: %s" % [trainer_name, line], "trainer")
+		if not pvp:
+			var line := "내가 이 지역의 관장이다! 실력을 보여 줘!" if kind == "leader" else "눈이 마주치면 포켓몬 승부지!"
+			_msg("%s: %s" % [trainer_name, line], "trainer")
+		else:
+			_msg("친구와의 포켓몬 승부!")
 		_msg("%s(은)는 %s(을)를 내보냈다!" % [trainer_name, enemy.name()])
 		_do(_enemy_cry)
 	_send_out_me(true)
@@ -99,6 +114,13 @@ func _show_me() -> void:
 
 func _enemy_cry() -> void:
 	main.voice.cry(enemy.name())
+
+
+func _first_healthy():
+	for m in my_party:
+		if not m.fainted():
+			return m
+	return null
 
 
 func _to_menu() -> void:
@@ -169,11 +191,18 @@ func advance() -> void:
 func choose_move(i: int) -> void:
 	if mode != "moves" or i >= me.moves.size():
 		return
+	if pvp:
+		_pvp_choose({"type": "move", "id": me.moves[i]})
+		return
 	_turn({"type": "move", "id": me.moves[i]})
 
 
 func use_item(item: String) -> void:
 	if mode != "bag" or main.items.get(item, 0) <= 0:
+		return
+	if pvp:
+		text = "친구와의 대전에서는 가방을 쓸 수 없다!"
+		shown = 999.0
 		return
 	if Data.BALLS.has(item):
 		if kind != "wild":
@@ -194,21 +223,32 @@ func use_item(item: String) -> void:
 func switch_to(idx: int) -> void:
 	if mode != "party":
 		return
-	var m = main.party[idx]
+	var m = my_party[idx]
 	if m.fainted() or m == me:
 		return
 	if forced_switch:
 		forced_switch = false
 		me = m
 		mode = "steps"
+		if pvp:
+			main.coop.send({"t": "fsw", "i": idx})
 		_send_out_me(false)
 		_do(_to_menu)
+		return
+	if pvp:
+		_pvp_choose({"type": "switch", "i": idx})
 		return
 	_turn({"type": "switch", "mon": m})
 
 
 func try_run() -> void:
 	if mode != "menu":
+		return
+	if pvp:
+		mode = "steps"
+		main.coop.send({"t": "forfeit"})
+		_msg("승부를 포기했다...")
+		_do(_finish.bind("lose"))
 		return
 	if kind != "wild":
 		mode = "steps"
@@ -306,6 +346,8 @@ func _swap_mon(nm) -> void:
 func _prefix(is_me: bool) -> String:
 	if is_me:
 		return ""
+	if pvp:
+		return "친구의 "
 	return "야생 " if kind == "wild" else "상대 "
 
 
@@ -322,6 +364,10 @@ func _attack_now(att, deff, mv: String, is_me: bool) -> void:
 		_front(out)
 		return
 	var r: Array = Mon.damage(att, deff, mv, rng)
+	_hit_steps(out, att, deff, mv, is_me, r)
+
+
+func _hit_steps(out: Array, att, deff, mv: String, is_me: bool, r: Array) -> void:
 	out.append({"do": _apply_hit.bind(att, deff, mv, r[0], r[1], is_me)})
 	out.append({"wait": 0.5})
 	if r[2]:
@@ -352,10 +398,13 @@ func _check_faint(m, is_me: bool) -> void:
 	if not m.fainted():
 		return
 	var out: Array = []
+	if pvp:
+		_pvp_faint(m, is_me)
+		return
 	if is_me:
 		out.append({"do": _hide_me})
 		out.append({"msg": "%s(은)는 쓰러졌다!" % m.name(), "speaker": ""})
-		if main.first_healthy() != null:
+		if _first_healthy() != null:
 			out.append({"do": _force_switch})
 		else:
 			out.append({"msg": "눈앞이 캄캄해졌다...", "speaker": ""})
@@ -461,6 +510,194 @@ func _ball_break() -> void:
 	e_visible = true
 
 
+# ------------------------------------------------------------------ 친구와 대전
+
+func _pvp_choose(a: Dictionary) -> void:
+	mode = "wait"
+	text = "친구를 기다리는 중..."
+	shown = 999.0
+	if main.coop.net.is_host:
+		pvp_my_act = a
+		_pvp_try_resolve()
+	else:
+		pvp_my_act = a
+		main.coop.send({"t": "act", "a": a})
+
+
+func pvp_foe_action(a: Dictionary) -> void:
+	if not visible or not pvp:
+		return
+	pvp_foe_act = a
+	_pvp_try_resolve()
+
+
+## 방장만: 두 행동이 다 모이면 턴 결과를 계산해서 보내고 연출
+func _pvp_try_resolve() -> void:
+	if not main.coop.net.is_host or pvp_my_act == null or pvp_foe_act == null or mode != "wait":
+		return
+	var ev := _pvp_resolve(pvp_my_act, pvp_foe_act)
+	pvp_my_act = null
+	pvp_foe_act = null
+	main.coop.send({"t": "turn", "ev": ev})
+	pvp_play(ev, true)
+
+
+func _pvp_resolve(ha: Dictionary, ga: Dictionary) -> Array:
+	var ev: Array = []
+	var act := {"h": me, "g": enemy}
+	var hp := {}
+	var acts := {"h": ha, "g": ga}
+	for who in ["h", "g"]:
+		if acts[who].type == "switch":
+			var arr: Array = my_party if who == "h" else enemy_party
+			act[who] = arr[int(acts[who].i)]
+			ev.append({"who": who, "k": "sw", "i": int(acts[who].i)})
+	hp["h"] = act.h.hp
+	hp["g"] = act.g.hp
+	var movers: Array = []
+	for who in ["h", "g"]:
+		if acts[who].type == "move":
+			movers.append(who)
+	if movers.size() == 2:
+		var hm: Array = Data.MOVES[ha.id]
+		var gm: Array = Data.MOVES[ga.id]
+		var h_first: bool
+		if hm[4] != gm[4]:
+			h_first = hm[4] > gm[4]
+		elif act.h.spd() != act.g.spd():
+			h_first = act.h.spd() > act.g.spd()
+		else:
+			h_first = rng.randf() < 0.5
+		movers = ["h", "g"] if h_first else ["g", "h"]
+	for who in movers:
+		var other := "g" if who == "h" else "h"
+		if hp[who] <= 0 or hp[other] <= 0:
+			continue
+		var mv: String = acts[who].id
+		var m: Array = Data.MOVES[mv]
+		var e := {"who": who, "k": "mv", "mv": mv, "miss": false, "dmg": 0, "eff": 1.0, "crit": false}
+		if m[2] > 0:
+			if rng.randi_range(1, 100) > m[3]:
+				e.miss = true
+			else:
+				var r: Array = Mon.damage(act[who], act[other], mv, rng)
+				e.dmg = r[0]
+				e.eff = r[1]
+				e.crit = r[2]
+				hp[other] = max(0, hp[other] - r[0])
+				if mv == "absorb":
+					hp[who] = min(act[who].max_hp(), hp[who] + max(1, r[0] / 2))
+		ev.append(e)
+	return ev
+
+
+## 턴 결과 연출 (방장/참가자 모두 같은 결과)
+func pvp_play(ev: Array, i_am_host: bool) -> void:
+	if not visible or not pvp:
+		return
+	mode = "steps"
+	steps.clear()
+	for e in ev:
+		var mine: bool = (e.who == "h") == i_am_host
+		if e.k == "sw":
+			if mine:
+				_msg("돌아와, %s!" % me.name())
+				_do(_swap_mon.bind(my_party[int(e.i)]))
+				_send_out_me(false)
+			else:
+				var nm = enemy_party[int(e.i)]
+				_msg("친구는 %s(을)를 내보냈다!" % nm.name())
+				_do(_next_enemy.bind(nm))
+		else:
+			_do(_pvp_attack.bind(e, mine))
+
+
+func _pvp_attack(e: Dictionary, mine: bool) -> void:
+	var att = me if mine else enemy
+	var deff = enemy if mine else me
+	if att.fainted() or deff.fainted():
+		return
+	var m: Array = Data.MOVES[e.mv]
+	var out: Array = []
+	out.append({"msg": "%s%s의 %s!" % [_prefix(mine), att.name(), m[0]], "speaker": ""})
+	if m[2] <= 0:
+		out.append({"msg": "그러나 아무 일도 일어나지 않았다!", "speaker": ""})
+		_front(out)
+	elif e.miss:
+		out.append({"msg": "그러나 빗나갔다!", "speaker": ""})
+		_front(out)
+	else:
+		_hit_steps(out, att, deff, e.mv, mine, [int(e.dmg), float(e.eff), bool(e.crit)])
+
+
+func _pvp_faint(m, is_me: bool) -> void:
+	var out: Array = []
+	if is_me:
+		out.append({"do": _hide_me})
+		out.append({"msg": "%s(은)는 쓰러졌다!" % m.name(), "speaker": ""})
+		if _first_healthy() != null:
+			out.append({"do": _force_switch})
+		else:
+			out.append({"msg": "친구에게 졌다...", "speaker": ""})
+			out.append({"do": _finish.bind("lose")})
+	else:
+		out.append({"do": _hide_enemy})
+		out.append({"msg": "친구의 %s(은)는 쓰러졌다!" % m.name(), "speaker": ""})
+		var left := enemy_party.filter(func(x): return not x.fainted())
+		if left.is_empty():
+			out.append({"msg": "친구와의 승부에서 이겼다!", "speaker": ""})
+			out.append({"do": _finish.bind("win")})
+		else:
+			out.append({"do": _wait_foe_switch})
+	_front(out)
+
+
+func _wait_foe_switch() -> void:
+	if pvp_pending_sw >= 0:
+		var i := pvp_pending_sw
+		pvp_pending_sw = -1
+		_apply_foe_switch(i)
+		return
+	waiting_foe_sw = true
+	mode = "wait"
+	text = "친구가 다음 포켓몬을 고르는 중..."
+	shown = 999.0
+
+
+func pvp_foe_switch(i: int) -> void:
+	if not visible or not pvp:
+		return
+	if waiting_foe_sw:
+		waiting_foe_sw = false
+		mode = "steps"
+		_apply_foe_switch(i)
+	else:
+		pvp_pending_sw = i
+
+
+func _apply_foe_switch(i: int) -> void:
+	var nm = enemy_party[i]
+	_front([{"msg": main.josa("친구는 %s(을)를 내보냈다!" % nm.name()), "speaker": ""}, {"do": _next_enemy.bind(nm)}])
+
+
+func pvp_foe_forfeit() -> void:
+	if not visible or not pvp or mode == "done":
+		return
+	steps.clear()
+	mode = "steps"
+	_msg("친구가 승부를 포기했다! 이겼다!")
+	_do(_finish.bind("win"))
+
+
+func pvp_foe_left() -> void:
+	if not visible or not pvp or mode == "done":
+		return
+	steps.clear()
+	mode = "steps"
+	_msg("친구와의 연결이 끊겼다...")
+	_do(_finish.bind("run"))
+
+
 func _finish(r: String) -> void:
 	result = r
 	mode = "done"
@@ -475,7 +712,7 @@ func buttons() -> Array:
 	var by := v.y - 190.0
 	match mode:
 		"menu":
-			var labels := [["fight", "싸우기", Color("e53935")], ["bag", "가방", Color("fb8c00")], ["party", "포켓몬", Color("43a047")], ["run", "도망", Color("1e88e5")]]
+			var labels := [["fight", "싸우기", Color("e53935")], ["bag", "가방", Color("fb8c00")], ["party", "포켓몬", Color("43a047")], ["run", "기권" if pvp else "도망", Color("1e88e5")]]
 			for i in 4:
 				out.append({"id": labels[i][0], "rect": Rect2(8 + (i % 2) * 176, by + (i / 2) * 64, 168, 56), "label": labels[i][1], "col": labels[i][2]})
 		"moves":
@@ -493,8 +730,8 @@ func buttons() -> Array:
 				i += 1
 			out.append({"id": "back", "rect": Rect2(8, by + 136, v.x - 16, 40), "label": "뒤로", "col": Color("546e7a")})
 		"party":
-			for i in main.party.size():
-				out.append({"id": "mon:%d" % i, "rect": Rect2(8, 70 + i * 54, v.x - 16, 48), "kind": "mon", "mon": main.party[i]})
+			for i in my_party.size():
+				out.append({"id": "mon:%d" % i, "rect": Rect2(8, 70 + i * 54, v.x - 16, 48), "kind": "mon", "mon": my_party[i]})
 			if not forced_switch:
 				out.append({"id": "back", "rect": Rect2(v.x - 76, 30, 68, 30), "label": "뒤로", "col": Color("546e7a")})
 	return out
@@ -569,17 +806,17 @@ func _draw() -> void:
 	if e_visible and enemy:
 		var ex := sin(t * 40.0) * 4.0 if e_shake > 0.0 else 0.0
 		if e_flash <= 0.0 or int(e_flash * 16.0) % 2 == 0:
-			Px.mon(self, enemy.id, Vector2(258 + ex, 154), 1.9)
+			main.spr.mon(self, enemy.id, Vector2(258 + ex, 154), 2)
 	if ball:
 		var bk: float = min(ball.t / 0.6, 1.0)
 		var bp := Vector2(lerp(80.0, 258.0, bk), lerp(320.0, 140.0, bk) - sin(bk * PI) * 80.0)
 		if bk >= 1.0:
 			bp = Vector2(258, 140) + Vector2(sin(ball.t * 14.0) * 3.0 * float(int(ball.t / 0.7) <= ball.shakes), 0)
-		Px.ball(self, bp, ball.kind, 7.0)
+		main.spr.ball(self, ball.kind, bp, 1)
 	# 내 포켓몬 (뒷모습 대신 좌우 반전)
 	if p_visible and me:
 		var px := sin(t * 40.0) * 4.0 if p_shake > 0.0 else 0.0
-		Px.mon(self, me.id, Vector2(96 + px, 316), 2.4, true)
+		main.spr.mon(self, me.id, Vector2(96 + px, 316), 3, true)
 	if enemy:
 		_info_box(Rect2(10, 34, 178, 42), enemy, e_hp, false)
 	if me:
@@ -607,7 +844,7 @@ func _draw() -> void:
 		draw_rect(Rect2(r.position + Vector2(2, 2), Vector2(r.size.x - 4, 3)), Color(1, 1, 1, 0.3))
 		var tx := 12.0
 		if b.has("ball") and Data.BALLS.has(b.ball):
-			Px.ball(self, r.position + Vector2(14, r.size.y * 0.5), b.ball, 6.0)
+			main.spr.ball(self, b.ball, r.position + Vector2(14, r.size.y * 0.5), 1)
 			tx = 28.0
 		var fs := 22 if r.size.y > 50 else 11
 		draw_string(f, r.position + Vector2(tx, r.size.y * 0.5 + fs * 0.4), b.label, HORIZONTAL_ALIGNMENT_LEFT, -1, fs, Color.WHITE)
@@ -622,7 +859,7 @@ func _mon_row(b: Dictionary) -> void:
 	var cur: bool = m == me
 	draw_rect(r, Color("90caf9") if cur else (Color("e0e0e0") if m.fainted() else Color("f8f8f8")))
 	draw_rect(r, Color("303030"), false, 2.0)
-	Px.mon(self, m.id, r.position + Vector2(26, 44), 0.75)
+	main.spr.mon(self, m.id, r.position + Vector2(28, 46), 1)
 	draw_string(f, r.position + Vector2(56, 18), m.name(), HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color("303030"))
 	draw_string(f, r.position + Vector2(150, 18), "Lv%d" % m.level, HORIZONTAL_ALIGNMENT_LEFT, -1, 11, Color("303030"))
 	var bar := Rect2(r.position + Vector2(56, 28), Vector2(150, 6))
